@@ -1,22 +1,22 @@
-import email
-import imaplib
 import os
 import json
+import time
 from email.utils import parseaddr
 from dotenv import load_dotenv
+from imap_tools import MailBox, AND
 
 # --- Configuration ---
 load_dotenv()
 IMAP_SERVER = os.getenv("IMAP_SERVER")
-IMAP_PORT = int(os.getenv("IMAP_PORT", 993))
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASS = os.getenv("EMAIL_PASS")
 
 DOWNLOAD_FOLDER = "plotter_attachments"
-METADATA_FOLDER = "plotter_metadata" # Folder for sender info
+METADATA_FOLDER = "plotter_metadata"
 SENDER_FILE = "allowed_senders.txt"
+PROCESSED_FOLDER = "Processed" # The email folder to move processed messages to
 
-# --- Helper Function ---
+# --- Helper Functions ---
 def load_allowed_senders(filename):
     """Loads a list of allowed senders from a text file."""
     if not os.path.exists(filename):
@@ -25,9 +25,44 @@ def load_allowed_senders(filename):
     with open(filename, "r") as f:
         return [line.strip() for line in f if line.strip()]
 
-# --- Main Script ---
-def download_attachments():
-    """Connects to email, downloads attachments, and saves sender metadata."""
+def process_email(mailbox, msg):
+    """Processes a single email message and then moves it."""
+    print(f"\nProcessing new email from {msg.from_} with subject: '{msg.subject}'")
+    
+    sender_email = parseaddr(msg.from_)[1]
+    has_attachment = False
+
+    for att in msg.attachments:
+        if att.content_type in ["image/png", "image/jpeg"]:
+            has_attachment = True
+            filename = att.filename
+            print(f"  📥 Found image attachment: '{filename}'")
+
+            # Save the attachment
+            filepath = os.path.join(DOWNLOAD_FOLDER, filename)
+            with open(filepath, "wb") as f:
+                f.write(att.payload)
+            
+            # Save the sender's email to a metadata file
+            base_name = os.path.splitext(filename)[0]
+            metadata_path = os.path.join(METADATA_FOLDER, f"{base_name}.json")
+            with open(metadata_path, 'w') as f:
+                json.dump({"sender": sender_email}, f)
+            print(f"  💾 Saved sender info for '{filename}'")
+
+    # If we successfully processed at least one attachment, move the email.
+    if has_attachment:
+        print(f"  -> Moving email to '{PROCESSED_FOLDER}' folder...")
+        res = mailbox.move([msg.uid], PROCESSED_FOLDER)
+        if res:
+            print("  ✅ Email moved successfully.")
+        else:
+            print(f"  ❌ Failed to move email. Status: {res}")
+
+
+# --- Main Listener ---
+def listen_for_emails():
+    """Uses IMAP IDLE to wait for new emails and processes them as they arrive."""
     if not all([IMAP_SERVER, EMAIL_USER, EMAIL_PASS]):
         print("❌ Error: IMAP_SERVER, EMAIL_USER, and EMAIL_PASS must be set in .env")
         return
@@ -37,60 +72,46 @@ def download_attachments():
         print("No allowed senders configured. Exiting.")
         return
 
-    # Create directories if they don't exist
     for folder in [DOWNLOAD_FOLDER, METADATA_FOLDER]:
         if not os.path.exists(folder):
             os.makedirs(folder)
 
-    try:
-        print(f"Connecting to {IMAP_SERVER} on port {IMAP_PORT}...")
-        mail = imaplib.IMAP4_SSL(IMAP_SERVER, IMAP_PORT)
-        mail.login(EMAIL_USER, EMAIL_PASS)
-        mail.select("inbox")
-        print("✅ Successfully connected to inbox.")
+    print("✅ Configuration loaded. Starting email listener...")
+    
+    # This outer loop makes the script resilient to network errors and timeouts.
+    while True:
+        try:
+            # Establish a new connection in each iteration of the loop
+            print("Attempting to connect to mailbox...")
+            with MailBox(IMAP_SERVER).login(EMAIL_USER, EMAIL_PASS) as mailbox:
+                if not mailbox.folder.exists(PROCESSED_FOLDER):
+                    print(f"❌ Error: The folder '{PROCESSED_FOLDER}' does not exist on the mail server.")
+                    print("Please create it and restart the script.")
+                    return
 
-        for sender in ALLOWED_SENDERS:
-            status, messages = mail.search(None, f'(UNSEEN FROM "{sender}")')
-            if status != "OK" or not messages[0]:
-                continue
-
-            print(f"Found new messages from {sender}. Processing...")
-            for email_id in messages[0].split():
-                _, msg_data = mail.fetch(email_id, "(RFC822)")
-                msg = email.message_from_bytes(msg_data[0][1])
+                print("✅ Connection successful. Performing initial check for unread mail...")
                 
-                # Extract sender's email address from the 'From' header
-                sender_email = parseaddr(msg['From'])[1]
+                # Process any existing unread mail first
+                for msg in mailbox.fetch(AND(seen=False, from_=ALLOWED_SENDERS), mark_seen=False):
+                    process_email(mailbox, msg)
 
-                if msg.is_multipart():
-                    for part in msg.walk():
-                        if part.get_content_maintype() == 'multipart' or part.get('Content-Disposition') is None:
-                            continue
+                print("🎧 Now listening for new emails...")
+                
+                # Wait for new messages. This will block until a new email arrives
+                # or the connection is terminated by the server.
+                responses = mailbox.idle.wait()
+                
+                # When wait() returns, it means there's new activity.
+                # The loop will then restart, reconnect, and process all unread mail.
+                print(f"New activity detected: {responses}. Restarting loop to process.")
 
-                        filename = part.get_filename()
-                        if filename and (filename.lower().endswith(('.png', '.jpg', '.jpeg'))):
-                            # Save the attachment
-                            filepath = os.path.join(DOWNLOAD_FOLDER, filename)
-                            with open(filepath, "wb") as f:
-                                f.write(part.get_payload(decode=True))
-                            print(f"  📥 Downloaded '{filename}'")
-
-                            # Save the sender's email to a metadata file
-                            base_name = os.path.splitext(filename)[0]
-                            metadata_path = os.path.join(METADATA_FOLDER, f"{base_name}.json")
-                            with open(metadata_path, 'w') as f:
-                                json.dump({"sender": sender_email}, f)
-                            print(f"  💾 Saved sender info to '{metadata_path}'")
-
-                mail.store(email_id, '+FLAGS', '\\Seen')
-
-    except Exception as e:
-        print(f"❌ An error occurred: {e}")
-    finally:
-        if 'mail' in locals() and mail.state == 'SELECTED':
-            mail.close()
-            mail.logout()
-            print("Disconnected from email server.")
+        except KeyboardInterrupt:
+            print("\nShutting down listener.")
+            break
+        except Exception as e:
+            # This block catches any error, including connection drops or timeouts
+            print(f"An error occurred: {e}. Reconnecting in 30 seconds...")
+            time.sleep(30)
 
 if __name__ == "__main__":
-    download_attachments()
+    listen_for_emails()
