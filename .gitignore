@@ -1,0 +1,31 @@
+# --- Python ---
+# Virtual Environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# --- Credentials ---
+# Ignore the file containing sensitive keys and passwords
+.env
+
+# --- Generated Output Folders ---
+# Ignore all folders containing downloaded or generated files
+plotter_attachments/
+plotter_gcode/
+plotter_svgs/
+plotter_metadata/
+sent_gcode/
+
+# --- Test Artifacts ---
+# Ignore any files generated specifically for testing
+test_config.ini
+test_image.png
+
+# --- OS-specific ---
+# Ignore macOS system files
+.DS_Store
+
+
+
+allowed_senders.txt
