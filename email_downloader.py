@@ -14,7 +14,7 @@ EMAIL_PASS = os.getenv("EMAIL_PASS")
 DOWNLOAD_FOLDER = "plotter_attachments"
 METADATA_FOLDER = "plotter_metadata"
 SENDER_FILE = "allowed_senders.txt"
-PROCESSED_FOLDER = "Processed" # The email folder to move processed messages to
+PROCESSED_FOLDER = "Processed"
 
 # --- Helper Functions ---
 def load_allowed_senders(filename):
@@ -27,7 +27,7 @@ def load_allowed_senders(filename):
 
 def process_email(mailbox, msg):
     """Processes a single email message and then moves it."""
-    print(f"\nProcessing new email from {msg.from_} with subject: '{msg.subject}'")
+    print(f"\nProcessing email from {msg.from_} with subject: '{msg.subject}'")
     
     sender_email = parseaddr(msg.from_)[1]
     has_attachment = False
@@ -38,19 +38,16 @@ def process_email(mailbox, msg):
             filename = att.filename
             print(f"  📥 Found image attachment: '{filename}'")
 
-            # Save the attachment
             filepath = os.path.join(DOWNLOAD_FOLDER, filename)
             with open(filepath, "wb") as f:
                 f.write(att.payload)
             
-            # Save the sender's email to a metadata file
             base_name = os.path.splitext(filename)[0]
             metadata_path = os.path.join(METADATA_FOLDER, f"{base_name}.json")
             with open(metadata_path, 'w') as f:
                 json.dump({"sender": sender_email}, f)
             print(f"  💾 Saved sender info for '{filename}'")
 
-    # If we successfully processed at least one attachment, move the email.
     if has_attachment:
         print(f"  -> Moving email to '{PROCESSED_FOLDER}' folder...")
         res = mailbox.move([msg.uid], PROCESSED_FOLDER)
@@ -59,10 +56,9 @@ def process_email(mailbox, msg):
         else:
             print(f"  ❌ Failed to move email. Status: {res}")
 
-
-# --- Main Listener ---
-def listen_for_emails():
-    """Uses IMAP IDLE to wait for new emails and processes them as they arrive."""
+# --- Main Function ---
+def check_for_emails():
+    """Connects to the inbox, processes all unread mail, and exits."""
     if not all([IMAP_SERVER, EMAIL_USER, EMAIL_PASS]):
         print("❌ Error: IMAP_SERVER, EMAIL_USER, and EMAIL_PASS must be set in .env")
         return
@@ -76,42 +72,29 @@ def listen_for_emails():
         if not os.path.exists(folder):
             os.makedirs(folder)
 
-    print("✅ Configuration loaded. Starting email listener...")
-    
-    # This outer loop makes the script resilient to network errors and timeouts.
-    while True:
-        try:
-            # Establish a new connection in each iteration of the loop
-            print("Attempting to connect to mailbox...")
-            with MailBox(IMAP_SERVER).login(EMAIL_USER, EMAIL_PASS) as mailbox:
-                if not mailbox.folder.exists(PROCESSED_FOLDER):
-                    print(f"❌ Error: The folder '{PROCESSED_FOLDER}' does not exist on the mail server.")
-                    print("Please create it and restart the script.")
-                    return
+    try:
+        print("Connecting to mailbox to check for unread mail...")
+        with MailBox(IMAP_SERVER).login(EMAIL_USER, EMAIL_PASS) as mailbox:
+            if not mailbox.folder.exists(PROCESSED_FOLDER):
+                print(f"❌ Error: The folder '{PROCESSED_FOLDER}' does not exist on the mail server.")
+                return
 
-                print("✅ Connection successful. Performing initial check for unread mail...")
-                
-                # Process any existing unread mail first
-                for msg in mailbox.fetch(AND(seen=False, from_=ALLOWED_SENDERS), mark_seen=False):
+            print("✅ Connection successful. Fetching messages...")
+            
+            # Fetch all unread messages from allowed senders and process them.
+            # The script will exit after this loop completes.
+            messages = list(mailbox.fetch(AND(seen=False, from_=ALLOWED_SENDERS), mark_seen=False))
+            if not messages:
+                print("No new messages found.")
+            else:
+                print(f"Found {len(messages)} new message(s).")
+                for msg in messages:
                     process_email(mailbox, msg)
+        
+        print("Email check complete.")
 
-                print("🎧 Now listening for new emails...")
-                
-                # Wait for new messages. This will block until a new email arrives
-                # or the connection is terminated by the server.
-                responses = mailbox.idle.wait()
-                
-                # When wait() returns, it means there's new activity.
-                # The loop will then restart, reconnect, and process all unread mail.
-                print(f"New activity detected: {responses}. Restarting loop to process.")
-
-        except KeyboardInterrupt:
-            print("\nShutting down listener.")
-            break
-        except Exception as e:
-            # This block catches any error, including connection drops or timeouts
-            print(f"An error occurred: {e}. Reconnecting in 30 seconds...")
-            time.sleep(30)
+    except Exception as e:
+        print(f"An error occurred: {e}.")
 
 if __name__ == "__main__":
-    listen_for_emails()
+    check_for_emails()

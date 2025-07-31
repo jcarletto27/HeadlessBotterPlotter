@@ -8,6 +8,12 @@
 #
 # To run the script, execute it from your terminal:
 # ./run_workflow.sh
+CURRENT_DIR=$(pwd)
+SCRIPT_PATH="$CURRENT_DIR/.venv/bin/activate"
+
+source $SCRIPT_PATH
+
+
 
 echo "--- 🤖 Starting Plotter Bot Workflow ---"
 echo ""

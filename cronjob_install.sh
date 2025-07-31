@@ -5,7 +5,7 @@
 
 # Get the absolute path to the current directory
 CURRENT_DIR=$(pwd)
-SCRIPT_PATH="$CURRENT_DIR/process_and_plot.sh"
+SCRIPT_PATH="$CURRENT_DIR/run_workflow.sh"
 LOG_PATH="$CURRENT_DIR/cron.log"
 
 # The command to be added to the crontab

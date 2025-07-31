@@ -2,13 +2,15 @@ import os
 import glob
 import configparser
 import vtracer
-import tempfile
+import re
+from xml.etree import ElementTree
 from svg_to_gcode.svg_parser import parse_file
 from svg_to_gcode.compiler import Compiler, interfaces
 
 # --- Configuration ---
 INPUT_FOLDER = "plotter_attachments"
 OUTPUT_FOLDER = "plotter_gcode"
+SVG_OUTPUT_FOLDER = "plotter_svgs" # For saving the intermediate SVGs
 CONFIG_FILE = "config.ini"
 PREAMBLE_FILE = "preamble.gcode"
 POSTAMBLE_FILE = "postamble.gcode"
@@ -75,132 +77,103 @@ def load_gcode_file(filename):
     """Reads a G-code file and returns its content as a list of lines."""
     if os.path.exists(filename):
         with open(filename, 'r') as f:
-            # Split content into a list of lines to prevent character-by-character iteration
             content = f.read().splitlines()
             print(f"✅ Loaded '{filename}'")
             return content
     print(f"ℹ️  '{filename}' not found, proceeding without it.")
-    return [] # Return an empty list if file not found
+    return []
 
-def _get_points(curve):
-    """A helper function to get all vector points from any curve object."""
-    points = []
-    for attr in ['start', 'end', 'control1', 'control2', 'center']:
-        if hasattr(curve, attr) and getattr(curve, attr) is not None:
-            points.append(getattr(curve, attr))
-    return points
+def get_svg_dimensions(svg_file):
+    """Parses an SVG file to get its width and height."""
+    tree = ElementTree.parse(svg_file)
+    root = tree.getroot()
+    width_str = root.get('width')
+    height_str = root.get('height')
+    
+    # Use regex to extract numerical values from strings like "210mm" or "100px"
+    width = float(re.findall(r"[\d\.]+", width_str)[0])
+    height = float(re.findall(r"[\d\.]+", height_str)[0])
+    
+    return width, height
 
-def _calculate_bounds(curves):
-    """Manually calculates the bounding box for a list of curve objects."""
-    min_x, min_y = float('inf'), float('inf')
-    max_x, max_y = float('-inf'), float('-inf')
+def scale_svg_file(svg_path, scale_factor):
+    """Wraps all drawing elements in an SVG file with a <g> tag to apply a uniform scale."""
+    if scale_factor == 1.0:
+        return # No scaling needed
 
-    if not curves:
-        return (0, 0), (0, 0)
+    ElementTree.register_namespace("", "http://www.w3.org/2000/svg")
+    
+    tree = ElementTree.parse(svg_path)
+    root = tree.getroot()
 
-    for curve in curves:
-        for p in _get_points(curve):
-            min_x = min(min_x, p.x)
-            min_y = min(min_y, p.y)
-            max_x = max(max_x, p.x)
-            max_y = max(max_y, p.y)
+    children_to_wrap = list(root)
+    g_element = ElementTree.Element("g", attrib={"transform": f"scale({scale_factor})"})
+    
+    for child in children_to_wrap:
+        root.remove(child)
+        g_element.append(child)
+    
+    root.append(g_element)
+    tree.write(svg_path)
 
-    return (min_x, min_y), (max_x, max_y)
-
-def _manual_transform(curves, scale=1.0, dx=0, dy=0):
-    """Manually scales and translates a list of curve objects."""
-    for curve in curves:
-        for p in _get_points(curve):
-            p.x = p.x * scale + dx
-            p.y = p.y * scale + dy
-
-def process_image_to_gcode(image_path, output_folder, config):
+def process_image_to_gcode(image_path, output_folder, svg_folder, config):
     """
-    Processes a single image file to a G-code file. This is the core testable logic.
+    Processes a single image file to a G-code file.
     Returns the path to the generated G-code file.
     """
-    # 1. Read the image file into bytes
-    with open(image_path, 'rb') as f:
-        input_img_bytes = f.read()
-
-    # Get the image format
-    img_format = os.path.splitext(image_path)[1].lstrip('.').lower()
+    base_filename = os.path.basename(image_path)
+    filename_no_ext = os.path.splitext(base_filename)[0]
     
-    # 2. Convert the raw image bytes to an SVG string
-    svg_str = vtracer.convert_raw_image_to_svg(input_img_bytes, img_format=img_format, colormode='binary')
+    svg_path = os.path.join(svg_folder, f"{filename_no_ext}.svg")
+    gcode_path = os.path.join(output_folder, f"{filename_no_ext}.gcode")
 
-    # 3. Instantiate a compiler with the custom plotter interface
-    compiler = Compiler(interface_class=PlotterGcodeInterface,
-                        movement_speed=float(config['pen_feed_rate_mm_min']),
-                        cutting_speed=float(config['pen_feed_rate_mm_min']))
+    # 1. Convert the image file directly to an SVG file.
+    vtracer.convert_image_to_svg_py(image_path, svg_path)
+    print(f"  💾 Saved traced SVG to '{svg_path}'")
+
+    # 2. Get drawing dimensions from the SVG file.
+    drawing_width, drawing_height = get_svg_dimensions(svg_path)
+
+    # 3. Determine the scale factor to fit within the plotter's boundaries.
+    plot_width = float(config['max_plot_x']) - float(config['min_plot_x'])
+    plot_height = float(config['max_plot_y']) - float(config['min_plot_y'])
     
-    # 4. Set the safe_z and plunge_depth on the interface from the config file
+    scale_factor = 1.0
+    if drawing_width > plot_width or drawing_height > plot_height:
+        scale_x = plot_width / drawing_width if drawing_width > 0 else 1
+        scale_y = plot_height / drawing_height if drawing_height > 0 else 1
+        scale_factor = min(scale_x, scale_y)
+        print(f"  - Scaling down by a factor of {scale_factor:.3f}")
+        scale_svg_file(svg_path, scale_factor)
+
+    # 4. Initialize the G-code compiler with the custom plotter interface.
+    compiler = Compiler(
+        interface_class=PlotterGcodeInterface,
+        movement_speed=float(config['pen_feed_rate_mm_min']),
+        cutting_speed=float(config['pen_feed_rate_mm_min']),
+        pass_depth=float(config['pen_down_position_mm'])
+    )
+    
     compiler.interface.safe_z = float(config['pen_travel_position_mm'])
     compiler.interface.plunge_depth = float(config['pen_down_position_mm'])
-    
-    # 5. Set preamble and postamble
+
     compiler.header = load_gcode_file(PREAMBLE_FILE)
     compiler.footer = load_gcode_file(POSTAMBLE_FILE)
 
-    # 6. Save SVG to a temporary file to be parsed
-    tmp_svg_file = None
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.svg', delete=False, encoding='utf-8') as f:
-            f.write(svg_str)
-            tmp_svg_file = f.name
-
-        # 7. Parse the svg file into geometric curves
-        curves = parse_file(tmp_svg_file)
-        
-        # 8. Manually scale and center the drawing
-        (min_cx, min_cy), (max_cx, max_cy) = _calculate_bounds(curves)
-        drawing_width = max_cx - min_cx
-        drawing_height = max_cy - min_cy
-
-        plot_width = float(config['max_plot_x']) - float(config['min_plot_x'])
-        plot_height = float(config['max_plot_y']) - float(config['min_plot_y'])
-
-        if drawing_width == 0 or drawing_height == 0:
-            scale_factor = 1.0
-        else:
-            scale_factor = min(plot_width / drawing_width, plot_height / drawing_height)
-
-        # First, translate the drawing so its top-left corner is at the origin (0,0)
-        _manual_transform(curves, dx=-min_cx, dy=-min_cy)
-        
-        # Next, scale the drawing
-        _manual_transform(curves, scale=scale_factor)
-
-        # Finally, translate the scaled drawing to the center of the plot area
-        plot_center_x = float(config['min_plot_x']) + plot_width / 2
-        plot_center_y = float(config['min_plot_y']) + plot_height / 2
-        
-        (scaled_min_cx, scaled_min_cy), (scaled_max_cx, scaled_max_cy) = _calculate_bounds(curves)
-        scaled_center_x = scaled_min_cx + (scaled_max_cx - scaled_min_cx) / 2
-        scaled_center_y = scaled_min_cy + (scaled_max_cy - scaled_min_cy) / 2
-        
-        _manual_transform(curves, dx=(plot_center_x - scaled_center_x), dy=(plot_center_y - scaled_center_y))
-
-        # 9. Append the transformed curves and compile to a G-code file
-        compiler.append_curves(curves)
-        filename = os.path.basename(image_path)
-        output_filename = os.path.splitext(filename)[0] + ".gcode"
-        output_path = os.path.join(output_folder, output_filename)
-        compiler.compile_to_file(output_path, passes=2)
-        
-        return output_path
-    finally:
-        # 10. Clean up the temporary file
-        if tmp_svg_file and os.path.exists(tmp_svg_file):
-            os.remove(tmp_svg_file)
-
+    # 5. Parse the (now possibly scaled) SVG file and compile to G-code.
+    curves = parse_file(svg_path)
+    compiler.append_curves(curves)
+    compiler.compile_to_file(gcode_path, passes=1)
+    
+    return gcode_path
 
 def main():
     """Main execution function."""
     config = load_config(CONFIG_FILE)
 
-    if not os.path.exists(OUTPUT_FOLDER):
-        os.makedirs(OUTPUT_FOLDER)
+    for folder in [OUTPUT_FOLDER, SVG_OUTPUT_FOLDER]:
+        if not os.path.exists(folder):
+            os.makedirs(folder)
 
     image_files = glob.glob(os.path.join(INPUT_FOLDER, "*.png")) + \
                   glob.glob(os.path.join(INPUT_FOLDER, "*.jpg")) + \
@@ -215,7 +188,7 @@ def main():
     for image_path in image_files:
         try:
             print(f"Processing '{os.path.basename(image_path)}'...")
-            output_path = process_image_to_gcode(image_path, OUTPUT_FOLDER, config)
+            output_path = process_image_to_gcode(image_path, OUTPUT_FOLDER, SVG_OUTPUT_FOLDER, config)
             print(f"  ✅ Successfully converted to '{os.path.basename(output_path)}'")
         except Exception as e:
             print(f"❌ Failed to convert {os.path.basename(image_path)}: {e}")
